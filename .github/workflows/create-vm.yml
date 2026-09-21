@@ -1,0 +1,676 @@
+name: OCI Osaka A1 Auto Create
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # 每小时 02、07、12、17、22、27、32、37、42、47、52、57 分执行
+    - cron: "2-59/5 * * * *"
+
+# 防止同一时间出现多个抢实例任务
+concurrency:
+  group: oci-a1-create
+  cancel-in-progress: false
+
+jobs:
+  create-a1:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ============================================================
+      # 1. Install OCI CLI
+      # ============================================================
+      - name: Install OCI CLI
+        shell: bash
+        run: |
+          set -e
+
+          echo "========================================"
+          echo "OCI A1 INSTANCE LAUNCH"
+          echo "========================================"
+          echo "Region:       ${{ secrets.OCI_CLI_REGION }}"
+          echo "AD:           ${{ secrets.OCI_CLI_AVAILABILITY_DOMAIN }}"
+          echo "Shape:        VM.Standard.A1.Flex"
+          echo "OCPU:         2"
+          echo "RAM:          12 GB"
+          echo "Boot volume:  100 GB"
+          echo "========================================"
+
+          echo ""
+          echo "Installing OCI CLI..."
+
+          python -m pip install --upgrade oci-cli
+
+          echo ""
+          echo "OCI CLI version:"
+          oci --version
+
+      # ============================================================
+      # 2. Prepare OCI variables
+      # ============================================================
+      - name: Prepare OCI variables
+        shell: bash
+        env:
+          REGION_RAW: ${{ secrets.OCI_CLI_REGION }}
+          COMPARTMENT_RAW: ${{ secrets.COMPARTMENT_ID }}
+          IMAGE_RAW: ${{ secrets.OCI_CLI_IMAGE }}
+          SUBNET_RAW: ${{ secrets.OCI_CLI_SUBNET }}
+          AD_RAW: ${{ secrets.OCI_CLI_AVAILABILITY_DOMAIN }}
+        run: |
+          set -e
+
+          REGION="$(printf '%s' "$REGION_RAW" | tr -d '\r\n')"
+          COMPARTMENT="$(printf '%s' "$COMPARTMENT_RAW" | tr -d '\r\n')"
+          IMAGE="$(printf '%s' "$IMAGE_RAW" | tr -d '\r\n')"
+          SUBNET="$(printf '%s' "$SUBNET_RAW" | tr -d '\r\n')"
+          AD="$(printf '%s' "$AD_RAW" | tr -d '\r\n')"
+
+          if [ -z "$REGION" ]; then
+            echo "ERROR: OCI_CLI_REGION is empty."
+            exit 1
+          fi
+
+          if [ -z "$COMPARTMENT" ]; then
+            echo "ERROR: COMPARTMENT_ID is empty."
+            exit 1
+          fi
+
+          if [ -z "$IMAGE" ]; then
+            echo "ERROR: OCI_CLI_IMAGE is empty."
+            exit 1
+          fi
+
+          if [ -z "$SUBNET" ]; then
+            echo "ERROR: OCI_CLI_SUBNET is empty."
+            exit 1
+          fi
+
+          if [ -z "$AD" ]; then
+            echo "ERROR: OCI_CLI_AVAILABILITY_DOMAIN is empty."
+            exit 1
+          fi
+
+          echo "OCI_CLI_REGION=$REGION" >> "$GITHUB_ENV"
+          echo "COMPARTMENT_ID=$COMPARTMENT" >> "$GITHUB_ENV"
+          echo "IMAGE_ID=$IMAGE" >> "$GITHUB_ENV"
+          echo "SUBNET_ID=$SUBNET" >> "$GITHUB_ENV"
+          echo "AD_NAME=$AD" >> "$GITHUB_ENV"
+
+          echo ""
+          echo "OCI variables prepared."
+          echo "Region: $REGION"
+          echo "AD:     $AD"
+
+      # ============================================================
+      # 3. Configure OCI CLI
+      # ============================================================
+      - name: Configure OCI CLI
+        shell: bash
+        env:
+          OCI_CLI_USER_RAW: ${{ secrets.OCI_CLI_USER }}
+          OCI_CLI_TENANCY_RAW: ${{ secrets.OCI_CLI_TENANCY }}
+          OCI_CLI_FINGERPRINT_RAW: ${{ secrets.OCI_CLI_FINGERPRINT }}
+          OCI_CLI_KEY: ${{ secrets.OCI_CLI_KEY }}
+        run: |
+          set -e
+
+          mkdir -p ~/.oci
+
+          OCI_CLI_USER="$(printf '%s' "$OCI_CLI_USER_RAW" | tr -d '\r\n')"
+          OCI_CLI_TENANCY="$(printf '%s' "$OCI_CLI_TENANCY_RAW" | tr -d '\r\n')"
+          OCI_CLI_FINGERPRINT="$(printf '%s' "$OCI_CLI_FINGERPRINT_RAW" | tr -d '\r\n')"
+
+          if [ -z "$OCI_CLI_USER" ]; then
+            echo "ERROR: OCI_CLI_USER is empty."
+            exit 1
+          fi
+
+          if [ -z "$OCI_CLI_TENANCY" ]; then
+            echo "ERROR: OCI_CLI_TENANCY is empty."
+            exit 1
+          fi
+
+          if [ -z "$OCI_CLI_FINGERPRINT" ]; then
+            echo "ERROR: OCI_CLI_FINGERPRINT is empty."
+            exit 1
+          fi
+
+          if [ -z "$OCI_CLI_KEY" ]; then
+            echo "ERROR: OCI_CLI_KEY is empty."
+            exit 1
+          fi
+
+          printf '%s\n' "$OCI_CLI_KEY" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${OCI_CLI_USER}
+          fingerprint=${OCI_CLI_FINGERPRINT}
+          tenancy=${OCI_CLI_TENANCY}
+          region=${OCI_CLI_REGION}
+          key_file=/home/runner/.oci/oci_api_key.pem
+          EOF
+
+          chmod 600 ~/.oci/config
+
+          echo "OCI CLI configured."
+
+      # ============================================================
+      # 4. Test OCI authentication
+      # ============================================================
+      - name: Test OCI authentication
+        shell: bash
+        run: |
+          set -e
+
+          echo ""
+          echo "========================================"
+          echo "Testing OCI authentication"
+          echo "========================================"
+
+          oci iam region list --output table
+
+          echo ""
+          echo "OCI authentication successful."
+
+      # ============================================================
+      # 5. Validate OCI resources
+      # ============================================================
+      - name: Validate OCI resources
+        shell: bash
+        run: |
+          set -e
+
+          echo ""
+          echo "========================================"
+          echo "Validating OCI resources"
+          echo "========================================"
+
+          echo "Checking compartment..."
+
+          oci iam compartment get \
+            --compartment-id "$COMPARTMENT_ID" \
+            --output json > /tmp/compartment.json
+
+          echo "Compartment OK."
+
+          echo ""
+          echo "Checking image..."
+
+          oci compute image get \
+            --image-id "$IMAGE_ID" \
+            --output json > /tmp/image.json
+
+          echo "Image OK."
+
+          echo ""
+          echo "Checking subnet..."
+
+          oci network subnet get \
+            --subnet-id "$SUBNET_ID" \
+            --output json > /tmp/subnet.json
+
+          echo "Subnet OK."
+
+          echo ""
+          echo "Checking availability domain..."
+
+          oci iam availability-domain list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --output json > /tmp/ad.json
+
+          echo "Availability domain OK."
+
+          echo ""
+          echo "Resource validation successful."
+
+      # ============================================================
+      # 6. Check whether instance already exists
+      # ============================================================
+      - name: Check existing instance
+        id: check_vm
+        shell: bash
+        env:
+          INSTANCE_NAME: coolify-vm
+        run: |
+          set -e
+
+          echo ""
+          echo "========================================"
+          echo "Checking existing instance"
+          echo "========================================"
+
+          RESULT=$(oci compute instance list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --display-name "$INSTANCE_NAME" \
+            --all \
+            --output json)
+
+          EXISTING=$(echo "$RESULT" | jq -r '
+            [
+              .data[]
+              | select(.["lifecycle-state"] != "TERMINATED")
+            ] | length
+          ')
+
+          echo "Existing instances: $EXISTING"
+
+          if [ "$EXISTING" -gt 0 ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+
+            echo ""
+            echo "========================================"
+            echo "Instance already exists."
+            echo "No launch required."
+            echo "========================================"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+
+            echo ""
+            echo "No existing instance found."
+            echo "Ready to launch A1."
+          fi
+
+      # ============================================================
+      # 7. Launch A1
+      #
+      # IMPORTANT:
+      # This step NEVER exits non-zero because we want GitHub Actions
+      # to remain green even when OCI capacity is unavailable.
+      # ============================================================
+      - name: Launch A1 instance
+        id: launch
+        if: steps.check_vm.outputs.exists == 'false'
+        shell: bash
+        env:
+          INSTANCE_NAME: coolify-vm
+          SSH_PUBLIC_KEY_RAW: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          # Do NOT use "set -e" here.
+          # We intentionally keep the workflow green on launch failure.
+
+          set -u
+
+          echo ""
+          echo "========================================"
+          echo "OCI A1 INSTANCE LAUNCH"
+          echo "========================================"
+          echo "Region:       $OCI_CLI_REGION"
+          echo "AD:           $AD_NAME"
+          echo "Shape:        VM.Standard.A1.Flex"
+          echo "OCPU:         2"
+          echo "RAM:          12 GB"
+          echo "Boot volume:  100 GB"
+          echo "Max attempts: 4"
+          echo "========================================"
+
+          # --------------------------------------------------------
+          # Prepare SSH public key
+          # --------------------------------------------------------
+
+          SSH_PUBLIC_KEY="$(printf '%s' "$SSH_PUBLIC_KEY_RAW" | tr -d '\r\n')"
+
+          if [ -z "$SSH_PUBLIC_KEY" ]; then
+            echo ""
+            echo "ERROR: SSH_PUBLIC_KEY is empty."
+            echo "Launch will not be attempted."
+            exit 0
+          fi
+
+          printf '%s\n' "$SSH_PUBLIC_KEY" > /tmp/oci_ssh_public_key.pub
+
+          echo ""
+          echo "SSH public key prepared."
+
+          # --------------------------------------------------------
+          # Retry settings
+          # --------------------------------------------------------
+
+          MAX_ATTEMPTS=4
+
+          # 60s -> 120s -> 240s
+          BACKOFF=60
+
+          SUCCESS=0
+          INSTANCE_ID=""
+
+          for ATTEMPT in $(seq 1 "$MAX_ATTEMPTS"); do
+
+            echo ""
+            echo "========================================"
+            echo "Launch attempt: $ATTEMPT / $MAX_ATTEMPTS"
+            echo "Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "========================================"
+
+            rm -f launch_result.json
+            rm -f launch_error.log
+
+            # ------------------------------------------------------
+            # Execute OCI launch
+            #
+            # stdout -> launch_result.json
+            # stderr -> launch_error.log
+            # ------------------------------------------------------
+
+            set +e
+
+            oci compute instance launch \
+              --compartment-id "$COMPARTMENT_ID" \
+              --availability-domain "$AD_NAME" \
+              --shape "VM.Standard.A1.Flex" \
+              --display-name "$INSTANCE_NAME" \
+              --subnet-id "$SUBNET_ID" \
+              --image-id "$IMAGE_ID" \
+              --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+              --boot-volume-size-in-gbs 100 \
+              --assign-public-ip true \
+              --ssh-authorized-keys-file /tmp/oci_ssh_public_key.pub \
+              --output json \
+              > launch_result.json \
+              2> launch_error.log
+
+            OCI_EXIT=$?
+
+            set -u
+
+            # ------------------------------------------------------
+            # SUCCESS
+            # ------------------------------------------------------
+
+            if [ "$OCI_EXIT" -eq 0 ]; then
+
+              echo ""
+              echo "========================================"
+              echo "OCI INSTANCE LAUNCH SUCCEEDED"
+              echo "========================================"
+
+              INSTANCE_ID=$(jq -r '.data.id // empty' launch_result.json)
+
+              if [ -z "$INSTANCE_ID" ]; then
+
+                echo ""
+                echo "WARNING:"
+                echo "OCI returned exit code 0 but no Instance OCID was found."
+
+                echo ""
+                echo "OCI response:"
+                cat launch_result.json
+
+                echo ""
+                echo "Workflow will remain SUCCESS."
+                exit 0
+              fi
+
+              echo ""
+              echo "Instance OCID:"
+              echo "$INSTANCE_ID"
+
+              echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
+              echo "CREATED=true" >> "$GITHUB_ENV"
+
+              SUCCESS=1
+
+              echo ""
+              echo "========================================"
+              echo "INSTANCE CREATED SUCCESSFULLY"
+              echo "========================================"
+
+              break
+            fi
+
+            # ------------------------------------------------------
+            # FAILURE
+            # ------------------------------------------------------
+
+            echo ""
+            echo "========================================"
+            echo "OCI LAUNCH FAILED"
+            echo "Exit code: $OCI_EXIT"
+            echo "========================================"
+
+            echo ""
+            echo "---------- OCI ERROR ----------"
+
+            if [ -s launch_error.log ]; then
+              cat launch_error.log
+            else
+              echo "No stderr output was returned by OCI CLI."
+            fi
+
+            echo ""
+            echo "---------- OCI RESPONSE ----------"
+
+            if [ -s launch_result.json ]; then
+              cat launch_result.json
+            else
+              echo "No stdout response was returned."
+            fi
+
+            echo ""
+            echo "---------- END OCI ERROR ----------"
+
+            # ------------------------------------------------------
+            # Read error text
+            # ------------------------------------------------------
+
+            ERROR_TEXT=""
+
+            if [ -f launch_error.log ]; then
+              ERROR_TEXT="$(cat launch_error.log)"
+            fi
+
+            # ------------------------------------------------------
+            # 429 / rate limiting
+            # ------------------------------------------------------
+
+            if echo "$ERROR_TEXT" | grep -Eqi \
+              '429|TooManyRequests|Too Many Requests|throttl|rate.?limit'; then
+
+              echo ""
+              echo "Detected OCI API rate limiting / HTTP 429."
+
+              if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
+
+                echo "Retrying after ${BACKOFF} seconds..."
+
+                sleep "$BACKOFF"
+
+                BACKOFF=$((BACKOFF * 2))
+
+                continue
+              fi
+
+              echo ""
+              echo "Maximum retry attempts reached for 429."
+              break
+            fi
+
+            # ------------------------------------------------------
+            # A1 host capacity
+            # ------------------------------------------------------
+
+            if echo "$ERROR_TEXT" | grep -Eqi \
+              'Out of host capacity|OutOfHostCapacity|out.?of.?host.?capacity'; then
+
+              echo ""
+              echo "Detected OCI A1 host capacity problem."
+
+              if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
+
+                echo "Retrying after ${BACKOFF} seconds..."
+
+                sleep "$BACKOFF"
+
+                BACKOFF=$((BACKOFF * 2))
+
+                continue
+              fi
+
+              echo ""
+              echo "Maximum retry attempts reached for host capacity."
+              break
+            fi
+
+            # ------------------------------------------------------
+            # Other OCI error
+            #
+            # We print it, but DO NOT fail GitHub Actions.
+            # ------------------------------------------------------
+
+            echo ""
+            echo "This appears to be a non-retryable OCI error."
+
+            echo ""
+            echo "The complete OCI error was printed above."
+
+            echo ""
+            echo "Workflow will remain SUCCESS."
+            break
+
+          done
+
+          # ========================================================
+          # Final result
+          # ========================================================
+
+          if [ "$SUCCESS" -eq 1 ]; then
+
+            echo ""
+            echo "========================================"
+            echo "FINAL RESULT: INSTANCE CREATED"
+            echo "========================================"
+
+          else
+
+            echo ""
+            echo "========================================"
+            echo "FINAL RESULT: NO INSTANCE CREATED"
+            echo "========================================"
+
+            echo ""
+            echo "This is NOT a GitHub Actions failure."
+            echo "The next scheduled run can try again."
+
+          fi
+
+          # ALWAYS return 0.
+          exit 0
+
+      # ============================================================
+      # 8. Send QQ success email
+      #
+      # Only runs when a real INSTANCE_ID was created.
+      # ============================================================
+      - name: Send QQ success email
+        if: env.CREATED == 'true'
+        shell: python
+        env:
+          INSTANCE_ID: ${{ env.INSTANCE_ID }}
+          REGION: ${{ env.OCI_CLI_REGION }}
+
+          QQ_SMTP_USER: ${{ secrets.QQ_SMTP_USER }}
+          QQ_SMTP_PASSWORD: ${{ secrets.QQ_SMTP_PASSWORD }}
+          QQ_RECEIVER: ${{ secrets.QQ_RECEIVER }}
+        run: |
+          import os
+          import smtplib
+
+          from email.mime.text import MIMEText
+          from email.header import Header
+
+          sender = os.environ["QQ_SMTP_USER"]
+          password = os.environ["QQ_SMTP_PASSWORD"]
+          receiver = os.environ["QQ_RECEIVER"]
+
+          instance_id = os.environ["INSTANCE_ID"]
+          region = os.environ["REGION"]
+
+          subject = "OCI 大阪 A1 ARM 创建成功"
+
+          body = f"""
+          OCI A1 ARM 实例创建成功！
+
+          ================================
+          实例名称：coolify-vm
+
+          Region：{region}
+
+          Shape：VM.Standard.A1.Flex
+          OCPU：2
+          RAM：12 GB
+          系统盘：100 GB
+
+          Instance OCID：
+          {instance_id}
+          ================================
+
+          GitHub Actions 已成功创建 OCI A1 ARM 实例。
+
+          请登录 Oracle Cloud Console 查看公网 IP。
+          """
+
+          message = MIMEText(
+              body,
+              "plain",
+              "utf-8"
+          )
+
+          message["From"] = sender
+          message["To"] = receiver
+          message["Subject"] = Header(
+              subject,
+              "utf-8"
+          )
+
+          print("Sending QQ success email...")
+
+          with smtplib.SMTP_SSL(
+              "smtp.qq.com",
+              465,
+              timeout=30
+          ) as server:
+
+              server.login(
+                  sender,
+                  password
+              )
+
+              server.sendmail(
+                  sender,
+                  [receiver],
+                  message.as_string()
+              )
+
+          print("QQ success email sent.")
+
+      # ============================================================
+      # 9. Final status
+      #
+      # This is intentionally always successful.
+      # ============================================================
+      - name: Final status
+        if: always()
+        shell: bash
+        run: |
+          echo ""
+          echo "========================================"
+          echo "OCI A1 WORKFLOW FINISHED"
+          echo "========================================"
+
+          if [ "${CREATED:-false}" = "true" ]; then
+
+            echo "Result: INSTANCE CREATED"
+            echo "Success email should have been sent."
+
+          else
+
+            echo "Result: NO INSTANCE CREATED"
+            echo "This is an expected non-fatal result."
+            echo "The next scheduled run will try again."
+
+          fi
+
+          echo ""
+          echo "GitHub Actions status: SUCCESS"
