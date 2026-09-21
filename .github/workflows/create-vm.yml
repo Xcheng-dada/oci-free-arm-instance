@@ -30,20 +30,37 @@ jobs:
       QQ_RECEIVER: ${{ secrets.QQ_RECEIVER }}
 
     steps:
+
+      # ==========================================
+      # 1. Install OCI CLI
+      # ==========================================
       - name: Install OCI CLI
         run: |
           python -m pip install --upgrade oci-cli
 
+      # ==========================================
+      # 2. Configure OCI CLI
+      # ==========================================
       - name: Configure OCI CLI
         shell: bash
         env:
-          OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
-          OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
-          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+          OCI_CLI_USER_RAW: ${{ secrets.OCI_CLI_USER }}
+          OCI_CLI_TENANCY_RAW: ${{ secrets.OCI_CLI_TENANCY }}
+          OCI_CLI_FINGERPRINT_RAW: ${{ secrets.OCI_CLI_FINGERPRINT }}
           OCI_CLI_KEY: ${{ secrets.OCI_CLI_KEY }}
         run: |
+          set -e
+
           mkdir -p ~/.oci
 
+          # Remove accidental CR/LF from scalar OCI credentials.
+          # This fixes:
+          # ValueError: Invalid header value
+          OCI_CLI_USER="$(printf '%s' "$OCI_CLI_USER_RAW" | tr -d '\r\n')"
+          OCI_CLI_TENANCY="$(printf '%s' "$OCI_CLI_TENANCY_RAW" | tr -d '\r\n')"
+          OCI_CLI_FINGERPRINT="$(printf '%s' "$OCI_CLI_FINGERPRINT_RAW" | tr -d '\r\n')"
+
+          # DO NOT remove line breaks from the PEM private key.
           printf '%s\n' "$OCI_CLI_KEY" > ~/.oci/oci_api_key.pem
           chmod 600 ~/.oci/oci_api_key.pem
 
@@ -59,8 +76,24 @@ jobs:
           chmod 600 ~/.oci/config
 
           echo "OCI CLI configured."
+
+      # ==========================================
+      # 3. Test OCI authentication
+      # ==========================================
+      - name: Test OCI authentication
+        shell: bash
+        run: |
+          set -e
+
+          echo "Testing OCI authentication..."
+
           oci iam region list --output table
 
+          echo "OCI authentication successful."
+
+      # ==========================================
+      # 4. Check whether instance already exists
+      # ==========================================
       - name: Check whether VM already exists
         id: check_vm
         shell: bash
@@ -76,8 +109,9 @@ jobs:
             --output json)
 
           EXISTING=$(echo "$RESULT" | jq -r '
-            [.data[] |
-              select(.["lifecycle-state"] != "TERMINATED")
+            [
+              .data[]
+              | select(.["lifecycle-state"] != "TERMINATED")
             ] | length
           ')
 
@@ -85,28 +119,54 @@ jobs:
 
           if [ "$EXISTING" -gt 0 ]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Instance already exists. Nothing to do."
+            echo ""
+            echo "========================================"
+            echo "Instance already exists."
+            echo "No new instance will be created."
+            echo "========================================"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
             echo "No existing instance found."
           fi
 
+      # ==========================================
+      # 5. Launch OCI A1 ARM instance
+      # ==========================================
       - name: Launch A1 instance
         if: steps.check_vm.outputs.exists == 'false'
         id: launch
         shell: bash
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
           set -e
 
+          echo ""
           echo "========================================"
           echo "Attempting OCI A1 instance creation"
-          echo "Region: $OCI_CLI_REGION"
-          echo "AD: $AD_NAME"
-          echo "Shape: VM.Standard.A1.Flex"
-          echo "OCPU: $OCPU_COUNT"
-          echo "RAM: ${MEMORY_GB} GB"
-          echo "Boot volume: ${BOOT_VOLUME_GB} GB"
           echo "========================================"
+          echo "Region:        $OCI_CLI_REGION"
+          echo "AD:            $AD_NAME"
+          echo "Shape:         VM.Standard.A1.Flex"
+          echo "OCPU:          $OCPU_COUNT"
+          echo "RAM:           ${MEMORY_GB} GB"
+          echo "Boot volume:   ${BOOT_VOLUME_GB} GB"
+          echo "Instance name: $INSTANCE_NAME"
+          echo "========================================"
+          echo ""
+
+          # Remove accidental CR/LF from SSH public key.
+          CLEAN_SSH_KEY="$(printf '%s' "$SSH_PUBLIC_KEY" | tr -d '\r\n')"
+
+          if [ -z "$CLEAN_SSH_KEY" ]; then
+            echo "ERROR: SSH_PUBLIC_KEY is empty."
+            exit 1
+          fi
+
+          # Create temporary SSH public-key file.
+          printf '%s\n' "$CLEAN_SSH_KEY" > /tmp/oci_ssh_public_key.pub
+
+          echo "Launching instance..."
 
           oci compute instance launch \
             --compartment-id "$COMPARTMENT_ID" \
@@ -118,12 +178,13 @@ jobs:
             --shape-config "{\"ocpus\":${OCPU_COUNT},\"memoryInGBs\":${MEMORY_GB}}" \
             --boot-volume-size-in-gbs "$BOOT_VOLUME_GB" \
             --assign-public-ip true \
-            --ssh-authorized-keys-file <(printf '%s\n' '${{ secrets.SSH_PUBLIC_KEY }}') \
-            --wait-for-state RUNNING \
-            --max-wait-seconds 600 \
+            --ssh-authorized-keys-file /tmp/oci_ssh_public_key.pub \
             --output json > launch_result.json
 
-          echo "Instance created successfully."
+          echo ""
+          echo "========================================"
+          echo "Instance creation request succeeded!"
+          echo "========================================"
 
           INSTANCE_ID=$(jq -r '.data.id' launch_result.json)
 
@@ -135,9 +196,30 @@ jobs:
 
           echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
 
+          echo ""
           echo "Instance OCID:"
           echo "$INSTANCE_ID"
 
+          echo ""
+          echo "Waiting for instance to reach RUNNING..."
+
+          oci compute instance get \
+            --instance-id "$INSTANCE_ID" \
+            --output json > instance_result.json
+
+          echo ""
+          echo "Instance details:"
+          jq '{
+            id: .data.id,
+            display_name: .data["display-name"],
+            lifecycle_state: .data["lifecycle-state"],
+            shape: .data.shape,
+            region: .data.region
+          }' instance_result.json
+
+      # ==========================================
+      # 6. Send QQ email after successful creation
+      # ==========================================
       - name: Send QQ success email
         if: steps.launch.outcome == 'success'
         shell: python
@@ -151,6 +233,7 @@ jobs:
         run: |
           import os
           import smtplib
+
           from email.mime.text import MIMEText
           from email.header import Header
 
@@ -167,19 +250,30 @@ jobs:
           body = f"""
           OCI A1 ARM 实例创建成功！
 
-          实例名称：{instance_name}
-          Region：{region}
-          Shape：VM.Standard.A1.Flex
-          OCPU：2
-          RAM：12 GB
-          系统盘：100 GB
+          实例名称：
+          {instance_name}
+
+          Region：
+          {region}
+
+          Shape：
+          VM.Standard.A1.Flex
+
+          OCPU：
+          2
+
+          RAM：
+          12 GB
+
+          系统盘：
+          100 GB
 
           Instance OCID：
           {instance_id}
 
-          GitHub Actions 已经成功完成实例创建。
+          GitHub Actions 已经成功完成 OCI A1 ARM 实例创建。
 
-          后续可以进入 Oracle Cloud Console 查看公网 IP。
+          请登录 Oracle Cloud Console 查看实例状态和公网 IP。
           """
 
           message = MIMEText(body, "plain", "utf-8")
@@ -187,18 +281,42 @@ jobs:
           message["To"] = receiver
           message["Subject"] = Header(subject, "utf-8")
 
-          print("Sending success email...")
+          print("Sending QQ success email...")
 
-          with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=30) as server:
+          with smtplib.SMTP_SSL(
+              "smtp.qq.com",
+              465,
+              timeout=30
+          ) as server:
+
               server.login(sender, password)
-              server.sendmail(sender, [receiver], message.as_string())
 
-          print("Success email sent.")
+              server.sendmail(
+                  sender,
+                  [receiver],
+                  message.as_string()
+              )
 
+          print("QQ success email sent successfully.")
+
+      # ==========================================
+      # 7. Failure information
+      # ==========================================
       - name: Creation failed
         if: failure()
         run: |
+          echo ""
           echo "========================================"
           echo "OCI A1 instance creation failed."
-          echo "The next scheduled run will retry."
           echo "========================================"
+          echo ""
+          echo "This attempt failed."
+          echo "The scheduled workflow will try again."
+          echo ""
+          echo "If the error is:"
+          echo ""
+          echo "  Out of host capacity"
+          echo ""
+          echo "then OCI currently has no available A1 capacity"
+          echo "in the selected Osaka availability domain."
+          echo ""
