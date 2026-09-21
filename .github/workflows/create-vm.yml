@@ -1,205 +1,60 @@
 name: OCI Osaka A1 Auto Create
 
 on:
-  workflow_dispatch:
+  # 每 10 分钟自动尝试一次
   schedule:
-    - cron: "2-59/5 * * * *"
+    - cron: "*/10 * * * *"
 
+  # 允许手动运行
+  workflow_dispatch:
+
+# 防止定时任务和手动任务同时运行
 concurrency:
-  group: oci-a1-create
+  group: oci-a1-instance-launch
   cancel-in-progress: false
 
+env:
+  COMPARTMENT_ID: ${{ secrets.COMPARTMENT_ID }}
+  IMAGE_ID: ${{ secrets.OCI_CLI_IMAGE }}
+  SUBNET_ID: ${{ secrets.OCI_CLI_SUBNET }}
+  AD_NAME: ${{ secrets.OCI_CLI_AVAILABILITY_DOMAIN }}
+
+  OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+  OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+  OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+  OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+  OCI_CLI_KEY: ${{ secrets.OCI_CLI_KEY }}
+
 jobs:
-  create-a1:
+  build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
 
-      # ==========================================
-      # 1. Install OCI CLI
-      # ==========================================
-      - name: Install OCI CLI
+      # ================================
+      # Cache pip
+      # ================================
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.local
+          key: ${{ runner.os }}-pip-oci-cli-v2
+
+      # ================================
+      # OCI CLI PATH
+      # ================================
+      - name: Add OCI CLI to PATH
         run: |
-          python -m pip install --upgrade oci-cli
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # ==========================================
-      # 2. Load and clean GitHub Secrets
-      # ==========================================
-      - name: Prepare OCI variables
-        shell: bash
-        env:
-          REGION_RAW: ${{ secrets.OCI_CLI_REGION }}
-          COMPARTMENT_RAW: ${{ secrets.COMPARTMENT_ID }}
-          IMAGE_RAW: ${{ secrets.OCI_CLI_IMAGE }}
-          SUBNET_RAW: ${{ secrets.OCI_CLI_SUBNET }}
-          AD_RAW: ${{ secrets.OCI_CLI_AVAILABILITY_DOMAIN }}
-
+      # ================================
+      # Launch OCI A1
+      # ================================
+      - name: Launch OCI A1 Instance
+        id: create_vm
         run: |
-          set -e
+          set -uo pipefail
 
-          # Remove accidental CR/LF from single-line values.
-          REGION="$(printf '%s' "$REGION_RAW" | tr -d '\r\n')"
-          COMPARTMENT="$(printf '%s' "$COMPARTMENT_RAW" | tr -d '\r\n')"
-          IMAGE="$(printf '%s' "$IMAGE_RAW" | tr -d '\r\n')"
-          SUBNET="$(printf '%s' "$SUBNET_RAW" | tr -d '\r\n')"
-          AD="$(printf '%s' "$AD_RAW" | tr -d '\r\n')"
-
-          echo "OCI_CLI_REGION=$REGION" >> "$GITHUB_ENV"
-          echo "COMPARTMENT_ID=$COMPARTMENT" >> "$GITHUB_ENV"
-          echo "IMAGE_ID=$IMAGE" >> "$GITHUB_ENV"
-          echo "SUBNET_ID=$SUBNET" >> "$GITHUB_ENV"
-          echo "AD_NAME=$AD" >> "$GITHUB_ENV"
-
-          echo "OCI variables prepared."
-
-          echo "Region: $REGION"
-          echo "AD: $AD"
-
-      # ==========================================
-      # 3. Configure OCI CLI
-      # ==========================================
-      - name: Configure OCI CLI
-        shell: bash
-        env:
-          OCI_CLI_USER_RAW: ${{ secrets.OCI_CLI_USER }}
-          OCI_CLI_TENANCY_RAW: ${{ secrets.OCI_CLI_TENANCY }}
-          OCI_CLI_FINGERPRINT_RAW: ${{ secrets.OCI_CLI_FINGERPRINT }}
-          OCI_CLI_KEY: ${{ secrets.OCI_CLI_KEY }}
-
-        run: |
-          set -e
-
-          mkdir -p ~/.oci
-
-          OCI_CLI_USER="$(printf '%s' "$OCI_CLI_USER_RAW" | tr -d '\r\n')"
-          OCI_CLI_TENANCY="$(printf '%s' "$OCI_CLI_TENANCY_RAW" | tr -d '\r\n')"
-          OCI_CLI_FINGERPRINT="$(printf '%s' "$OCI_CLI_FINGERPRINT_RAW" | tr -d '\r\n')"
-
-          # IMPORTANT:
-          # Do NOT remove newlines from the PEM private key.
-          printf '%s\n' "$OCI_CLI_KEY" > ~/.oci/oci_api_key.pem
-
-          chmod 600 ~/.oci/oci_api_key.pem
-
-          cat > ~/.oci/config <<EOF
-          [DEFAULT]
-          user=${OCI_CLI_USER}
-          fingerprint=${OCI_CLI_FINGERPRINT}
-          tenancy=${OCI_CLI_TENANCY}
-          region=${OCI_CLI_REGION}
-          key_file=/home/runner/.oci/oci_api_key.pem
-          EOF
-
-          chmod 600 ~/.oci/config
-
-          echo "OCI CLI configured."
-
-      # ==========================================
-      # 4. Test OCI authentication
-      # ==========================================
-      - name: Test OCI authentication
-        shell: bash
-        run: |
-          set -e
-
-          echo "Testing OCI authentication..."
-
-          oci iam region list --output table
-
-          echo "OCI authentication successful."
-
-      # ==========================================
-      # 5. Validate OCI resources
-      # ==========================================
-      - name: Validate OCI resources
-        shell: bash
-        run: |
-          set -e
-
-          echo "Checking compartment..."
-          oci iam compartment get \
-            --compartment-id "$COMPARTMENT_ID" \
-            --output json > /tmp/compartment.json
-
-          echo "Checking image..."
-          oci compute image get \
-            --image-id "$IMAGE_ID" \
-            --output json > /tmp/image.json
-
-          echo "Checking subnet..."
-          oci network subnet get \
-            --subnet-id "$SUBNET_ID" \
-            --output json > /tmp/subnet.json
-
-          echo "Checking availability domains..."
-
-          oci iam availability-domain list \
-            --compartment-id "$COMPARTMENT_ID" \
-            --output json > /tmp/ad.json
-
-          echo ""
-          echo "Resource validation successful."
-
-      # ==========================================
-      # 6. Check existing instance
-      # ==========================================
-      - name: Check whether VM already exists
-        id: check_vm
-        shell: bash
-        env:
-          INSTANCE_NAME: coolify-vm
-
-        run: |
-          set -e
-
-          echo "Checking for existing instance..."
-
-          RESULT=$(oci compute instance list \
-            --compartment-id "$COMPARTMENT_ID" \
-            --display-name "$INSTANCE_NAME" \
-            --all \
-            --output json)
-
-          EXISTING=$(echo "$RESULT" | jq -r '
-            [
-              .data[]
-              | select(.["lifecycle-state"] != "TERMINATED")
-            ] | length
-          ')
-
-          echo "Existing instances: $EXISTING"
-
-          if [ "$EXISTING" -gt 0 ]; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-
-            echo ""
-            echo "========================================"
-            echo "Instance already exists."
-            echo "Nothing to create."
-            echo "========================================"
-
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-
-            echo "No existing instance found."
-          fi
-
-      # ==========================================
-      # 7. Launch A1 ARM instance
-      # ==========================================
-      - name: Launch A1 instance
-        if: steps.check_vm.outputs.exists == 'false'
-        id: launch
-        continue-on-error: true
-        shell: bash
-        env:
-          INSTANCE_NAME: coolify-vm
-          SSH_PUBLIC_KEY_RAW: ${{ secrets.SSH_PUBLIC_KEY }}
-
-        run: |
-          set -e
-
-          echo ""
           echo "========================================"
           echo "OCI A1 INSTANCE LAUNCH"
           echo "========================================"
@@ -212,149 +67,203 @@ jobs:
           echo "========================================"
           echo ""
 
-          # SSH public key should be one line.
-          SSH_PUBLIC_KEY="$(printf '%s' "$SSH_PUBLIC_KEY_RAW" | tr -d '\r\n')"
+          # --------------------------------
+          # Install OCI CLI
+          # --------------------------------
+          echo "Installing OCI CLI..."
 
-          if [ -z "$SSH_PUBLIC_KEY" ]; then
-            echo "ERROR: SSH_PUBLIC_KEY is empty."
-            exit 1
-          fi
+          pip install --user --upgrade oci-cli
 
-          printf '%s\n' "$SSH_PUBLIC_KEY" > /tmp/oci_ssh_public_key.pub
+          echo ""
+          echo "OCI CLI version:"
+          oci --version
+          echo ""
+
+          # --------------------------------
+          # Prepare OCI config
+          # --------------------------------
+          mkdir -p ~/.oci
+
+          printf '%s\n' "${OCI_CLI_KEY}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${OCI_CLI_USER}
+          tenancy=${OCI_CLI_TENANCY}
+          fingerprint=${OCI_CLI_FINGERPRINT}
+          key_file=~/.oci/oci_api_key.pem
+          region=${OCI_CLI_REGION}
+          EOF
+
+          chmod 600 ~/.oci/config
+
+          # --------------------------------
+          # Prepare SSH public key
+          # --------------------------------
+          printf '%s\n' "${{ secrets.SSH_PUBLIC_KEY }}" \
+            > /home/runner/my_ssh_key.pub
+
+          chmod 600 /home/runner/my_ssh_key.pub
 
           echo "SSH public key prepared."
-
           echo ""
-          echo "Launching instance..."
 
-          oci compute instance launch \
-            --compartment-id "$COMPARTMENT_ID" \
-            --availability-domain "$AD_NAME" \
-            --shape "VM.Standard.A1.Flex" \
-            --display-name "$INSTANCE_NAME" \
-            --subnet-id "$SUBNET_ID" \
-            --image-id "$IMAGE_ID" \
-            --shape-config '{"ocpus":2,"memoryInGBs":12}' \
-            --boot-volume-size-in-gbs 100 \
-            --assign-public-ip true \
-            --ssh-authorized-keys-file /tmp/oci_ssh_public_key.pub \
-            --output json > launch_result.json
+          # --------------------------------
+          # Launch function
+          # --------------------------------
+          launch_instance() {
+            oci compute instance launch \
+              --compartment-id "$COMPARTMENT_ID" \
+              --availability-domain "$AD_NAME" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+              --subnet-id "$SUBNET_ID" \
+              --image-id "$IMAGE_ID" \
+              --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
+              --assign-public-ip true \
+              --display-name "coolify-vm" \
+              --boot-volume-size-in-gbs 100 \
+              2>&1
+          }
 
-          echo ""
-          echo "========================================"
-          echo "INSTANCE CREATION REQUEST SUCCEEDED"
-          echo "========================================"
+          # ========================================
+          # Launch / retry
+          # ========================================
 
-          INSTANCE_ID=$(jq -r '.data.id' launch_result.json)
+          MAX_429_RETRIES=3
 
-          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "null" ]; then
-            echo "ERROR: Instance OCID not found."
+          for ATTEMPT in $(seq 1 $((MAX_429_RETRIES + 1))); do
 
-            cat launch_result.json
+            echo ""
+            echo "========================================"
+            echo "Launch attempt: $ATTEMPT / $((MAX_429_RETRIES + 1))"
+            echo "Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "========================================"
+            echo ""
 
-            exit 1
-          fi
+            OCI_OUTPUT="$(launch_instance)"
+            OCI_EXIT_CODE=$?
 
-          echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
+            echo ""
+            echo "========== OCI OUTPUT =========="
+            echo "$OCI_OUTPUT"
+            echo "================================"
+            echo ""
 
-          echo ""
-          echo "Instance OCID:"
-          echo "$INSTANCE_ID"
+            # ========================================
+            # SUCCESS
+            # ========================================
 
-      # ==========================================
-      # 8. Send QQ email
-      # ==========================================
-      - name: Send QQ success email
-        if: steps.launch.outcome == 'success'
-        shell: python
-        env:
-          INSTANCE_ID: ${{ env.INSTANCE_ID }}
-          REGION: ${{ env.OCI_CLI_REGION }}
-          QQ_SMTP_USER: ${{ secrets.QQ_SMTP_USER }}
-          QQ_SMTP_PASSWORD: ${{ secrets.QQ_SMTP_PASSWORD }}
-          QQ_RECEIVER: ${{ secrets.QQ_RECEIVER }}
+            if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
 
-        run: |
-          import os
-          import smtplib
+              echo ""
+              echo "========================================"
+              echo "SUCCESS"
+              echo "========================================"
+              echo "OCI accepted the instance creation request."
+              echo "Instance is PROVISIONING."
+              echo "========================================"
 
-          from email.mime.text import MIMEText
-          from email.header import Header
+              exit 0
+            fi
 
-          sender = os.environ["QQ_SMTP_USER"]
-          password = os.environ["QQ_SMTP_PASSWORD"]
-          receiver = os.environ["QQ_RECEIVER"]
+            if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "RUNNING"'; then
 
-          instance_id = os.environ["INSTANCE_ID"]
-          region = os.environ["REGION"]
+              echo ""
+              echo "========================================"
+              echo "SUCCESS"
+              echo "========================================"
+              echo "Instance is RUNNING."
+              echo "========================================"
 
-          subject = "OCI Osaka A1 ARM 创建成功"
+              exit 0
+            fi
 
-          body = f"""
-          OCI A1 ARM 实例创建成功！
+            # ========================================
+            # 429 TooManyRequests
+            # ========================================
 
-          ==============================
-          实例名称：coolify-vm
-          Region：{region}
+            if echo "$OCI_OUTPUT" | grep -q '"code": "TooManyRequests"'; then
 
-          Shape：VM.Standard.A1.Flex
-          OCPU：2
-          RAM：12 GB
-          系统盘：100 GB
+              echo ""
+              echo "========================================"
+              echo "OCI API RATE LIMIT - 429"
+              echo "========================================"
+              echo "Oracle returned TooManyRequests."
+              echo ""
 
-          Instance OCID：
-          {instance_id}
-          ==============================
+              if [ "$ATTEMPT" -le "$MAX_429_RETRIES" ]; then
 
-          GitHub Actions 已成功创建 OCI A1 实例。
+                case "$ATTEMPT" in
+                  1)
+                    WAIT_TIME=60
+                    ;;
+                  2)
+                    WAIT_TIME=120
+                    ;;
+                  3)
+                    WAIT_TIME=300
+                    ;;
+                  *)
+                    WAIT_TIME=300
+                    ;;
+                esac
 
-          请登录 Oracle Cloud Console 查看公网 IP。
-          """
+                echo "Waiting ${WAIT_TIME} seconds before retry..."
+                sleep "$WAIT_TIME"
 
-          message = MIMEText(
-              body,
-              "plain",
-              "utf-8"
-          )
+                continue
+              fi
 
-          message["From"] = sender
-          message["To"] = receiver
-          message["Subject"] = Header(
-              subject,
-              "utf-8"
-          )
+              echo ""
+              echo "========================================"
+              echo "429 RETRY LIMIT REACHED"
+              echo "========================================"
+              echo "No more retries in this workflow."
+              echo "The next scheduled run will try again."
+              echo "GitHub Action will remain SUCCESS."
+              echo "========================================"
 
-          print("Sending QQ success email...")
+              # 故意返回成功，避免 GitHub 失败邮件
+              exit 0
+            fi
 
-          with smtplib.SMTP_SSL(
-              "smtp.qq.com",
-              465,
-              timeout=30
-          ) as server:
+            # ========================================
+            # Out of host capacity
+            # ========================================
 
-              server.login(
-                  sender,
-                  password
-              )
+            if echo "$OCI_OUTPUT" | grep -qi "Out of host capacity"; then
 
-              server.sendmail(
-                  sender,
-                  [receiver],
-                  message.as_string()
-              )
+              echo ""
+              echo "========================================"
+              echo "OUT OF HOST CAPACITY"
+              echo "========================================"
+              echo "OCI currently has no available A1 host."
+              echo ""
+              echo "The next scheduled run will try again."
+              echo "GitHub Action will remain SUCCESS."
+              echo "========================================"
 
-          print("QQ success email sent.")
+              # 故意返回成功
+              exit 0
+            fi
 
-      # ==========================================
-      # 9. Failure information
-      # ==========================================
-      - name: Creation failed
-        if: failure()
-        run: |
-          echo ""
-          echo "========================================"
-          echo "OCI A1 creation attempt FAILED"
-          echo "========================================"
-          echo ""
-          echo "The next scheduled run will retry."
-          echo ""
+            # ========================================
+            # Other OCI error
+            # ========================================
+
+            echo ""
+            echo "========================================"
+            echo "OCI INSTANCE CREATION FAILED"
+            echo "========================================"
+            echo "Exit code: $OCI_EXIT_CODE"
+            echo ""
+            echo "The next scheduled run will try again."
+            echo "GitHub Action will remain SUCCESS."
+            echo "========================================"
+
+            # 其他错误也故意返回成功
+            exit 0
+
+          done
