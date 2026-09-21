@@ -1,13 +1,11 @@
 name: Try to Create OCI VM
 
-# 每 5 分钟尝试一次
 on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
 
 env:
-  # OCI 基础资源
   COMPARTMENT_ID: ${{ secrets.COMPARTMENT_ID }}
   IMAGE_ID: ${{ secrets.OCI_CLI_IMAGE }}
   SUBNET_ID: ${{ secrets.OCI_CLI_SUBNET }}
@@ -20,26 +18,16 @@ jobs:
 
     steps:
 
-      # ==============================
-      # 缓存 OCI CLI
-      # ==============================
       - name: Cache pip packages
-        id: cache-pip
         uses: actions/cache@v4
         with:
           path: ~/.local
           key: ${{ runner.os }}-pip-oci-cli-v1
 
-      # ==============================
-      # 把 ~/.local/bin 加入 PATH
-      # ==============================
       - name: Add OCI CLI to path
         run: |
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # ==============================
-      # 安装 OCI CLI + 尝试创建 A1
-      # ==============================
       - name: Setup OCI CLI and Try to Create VM
         id: create_vm
         continue-on-error: true
@@ -50,79 +38,167 @@ jobs:
 
           echo "========================================"
           echo "OCI A1 VM Creation Attempt"
+          echo "========================================"
+
+          pip install oci-cli
+
+          mkdir -p ~/.oci
+
+          # ========================================
+          # 写入 API Key
+          # ========================================
+
+          printf '%s\n' "${{ secrets.OCI_CLI_KEY }}" \
+            | sed 's/\r$//' \
+            > ~/.oci/oci_api_key.pem
+
+          chmod 600 ~/.oci/oci_api_key.pem
+
+          # ========================================
+          # 写入 OCI config
+          # ========================================
+
+          USER_ID="$(printf '%s' '${{ secrets.OCI_CLI_USER }}' | tr -d '\r\n')"
+          TENANCY_ID="$(printf '%s' '${{ secrets.OCI_CLI_TENANCY }}' | tr -d '\r\n')"
+          FINGERPRINT="$(printf '%s' '${{ secrets.OCI_CLI_FINGERPRINT }}' | tr -d '\r\n')"
+          REGION="$(printf '%s' '${{ secrets.OCI_CLI_REGION }}' | tr -d '\r\n')"
+
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=$USER_ID
+          tenancy=$TENANCY_ID
+          fingerprint=$FINGERPRINT
+          key_file=~/.oci/oci_api_key.pem
+          region=$REGION
+          EOF
+
+          chmod 600 ~/.oci/config
+
+          # ========================================
+          # 清理资源参数中的隐藏换行
+          # ========================================
+
+          COMPARTMENT_ID="$(printf '%s' "$COMPARTMENT_ID" | tr -d '\r\n')"
+          IMAGE_ID="$(printf '%s' "$IMAGE_ID" | tr -d '\r\n')"
+          SUBNET_ID="$(printf '%s' "$SUBNET_ID" | tr -d '\r\n')"
+          AD_NAME="$(printf '%s' "$AD_NAME" | tr -d '\r\n')"
+          OCI_CLI_REGION="$(printf '%s' "$OCI_CLI_REGION" | tr -d '\r\n')"
+
+          # ========================================
+          # 显示配置
+          # 不显示任何 OCID
+          # ========================================
+
           echo "Region: $OCI_CLI_REGION"
           echo "Availability Domain: $AD_NAME"
           echo "Shape: VM.Standard.A1.Flex"
           echo "OCPU: 2"
           echo "Memory: 12 GB"
           echo "Boot Volume: 50 GB"
-          echo "========================================"
 
-          # ==============================
-          # 安装 OCI CLI
-          # ==============================
-          pip install oci-cli
+          # ========================================
+          # SSH 公钥
+          # ========================================
 
-          # ==============================
-          # 创建 OCI 配置目录
-          # ==============================
-          mkdir -p ~/.oci
-
-          # ==============================
-          # 写入 OCI API 私钥
-          # ==============================
-          printf '%s\n' "${{ secrets.OCI_CLI_KEY }}" > ~/.oci/oci_api_key.pem
-
-          chmod 600 ~/.oci/oci_api_key.pem
-
-          # ==============================
-          # 写入 OCI config
-          # ==============================
-          cat > ~/.oci/config <<EOF
-          [DEFAULT]
-          user=${{ secrets.OCI_CLI_USER }}
-          tenancy=${{ secrets.OCI_CLI_TENANCY }}
-          fingerprint=${{ secrets.OCI_CLI_FINGERPRINT }}
-          key_file=~/.oci/oci_api_key.pem
-          region=${{ secrets.OCI_CLI_REGION }}
-          EOF
-
-          # 修复 config 权限
-          chmod 600 ~/.oci/config
-
-          # ==============================
-          # 写入 SSH 公钥
-          # ==============================
-          printf '%s\n' "${{ secrets.SSH_PUBLIC_KEY }}" > /home/runner/my_ssh_key.pub
+          printf '%s\n' "${{ secrets.SSH_PUBLIC_KEY }}" \
+            | sed 's/\r$//' \
+            > /home/runner/my_ssh_key.pub
 
           chmod 600 /home/runner/my_ssh_key.pub
 
-          # ==============================
+          # ========================================
           # 测试 OCI API 认证
-          # ==============================
+          # ========================================
+
           echo ""
           echo "========================================"
-          echo "Testing OCI authentication..."
+          echo "1. Testing OCI authentication..."
           echo "========================================"
 
-          if oci iam region list --output json >/tmp/oci_test.json 2>&1; then
+          if oci iam region list --output json >/tmp/oci_auth.json 2>&1; then
             echo "OCI authentication OK."
           else
             echo "OCI authentication FAILED."
-
-            echo "========== OCI AUTH OUTPUT =========="
-            cat /tmp/oci_test.json
-            echo "====================================="
-
+            cat /tmp/oci_auth.json
             exit 1
           fi
 
-          # ==============================
-          # 创建 A1 VM
-          # ==============================
+          # ========================================
+          # 检查 Availability Domain
+          # ========================================
+
           echo ""
           echo "========================================"
-          echo "Starting A1 VM creation..."
+          echo "2. Checking Availability Domain..."
+          echo "========================================"
+
+          if oci iam availability-domain list \
+            --compartment-id "$TENANCY_ID" \
+            --output json >/tmp/oci_ad.json 2>&1; then
+
+            echo "Availability Domain API OK."
+
+          else
+
+            echo "Availability Domain check FAILED."
+            cat /tmp/oci_ad.json
+            exit 1
+
+          fi
+
+          # ========================================
+          # 检查 Image
+          # ========================================
+
+          echo ""
+          echo "========================================"
+          echo "3. Checking Image..."
+          echo "========================================"
+
+          if oci compute image get \
+            --image-id "$IMAGE_ID" \
+            --output json >/tmp/oci_image.json 2>&1; then
+
+            echo "Image OK."
+
+          else
+
+            echo "Image check FAILED."
+            cat /tmp/oci_image.json
+            exit 1
+
+          fi
+
+          # ========================================
+          # 检查 Subnet
+          # ========================================
+
+          echo ""
+          echo "========================================"
+          echo "4. Checking Subnet..."
+          echo "========================================"
+
+          if oci network subnet get \
+            --subnet-id "$SUBNET_ID" \
+            --output json >/tmp/oci_subnet.json 2>&1; then
+
+            echo "Subnet OK."
+
+          else
+
+            echo "Subnet check FAILED."
+            cat /tmp/oci_subnet.json
+            exit 1
+
+          fi
+
+          # ========================================
+          # 创建 A1 VM
+          # ========================================
+
+          echo ""
+          echo "========================================"
+          echo "5. Launching A1 VM..."
           echo "========================================"
 
           OCI_OUTPUT=$(oci compute instance launch \
@@ -138,43 +214,42 @@ jobs:
             --boot-volume-size-in-gbs 50 \
             2>&1 || true)
 
-          # ==============================
-          # 输出 OCI 返回结果
-          # ==============================
           echo ""
           echo "========== OCI OUTPUT =========="
           echo "$OCI_OUTPUT"
           echo "================================"
           echo ""
 
-          # 保存日志到 GitHub Actions output
           {
             echo "log_data<<EOF"
             echo "$OCI_OUTPUT"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-          # ==============================
-          # 判断是否创建成功
-          # ==============================
+          # ========================================
+          # 判断创建结果
+          # ========================================
 
           if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
+
             echo "========================================"
             echo "SUCCESS! A1 VM is PROVISIONING."
             echo "========================================"
+
             exit 0
+
           fi
 
           if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "RUNNING"'; then
+
             echo "========================================"
             echo "SUCCESS! A1 VM is RUNNING."
             echo "========================================"
+
             exit 0
+
           fi
 
-          # ==============================
-          # 创建失败
-          # ==============================
           echo "========================================"
           echo "A1 creation attempt failed."
           echo "The next scheduled run will try again."
