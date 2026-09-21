@@ -3,7 +3,7 @@ name: OCI Osaka A1 Auto Create
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "2-59/5 * * * *"
 
 concurrency:
   group: oci-a1-create
