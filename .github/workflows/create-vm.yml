@@ -190,6 +190,7 @@ jobs:
       - name: Launch A1 instance
         if: steps.check_vm.outputs.exists == 'false'
         id: launch
+        continue-on-error: true
         shell: bash
         env:
           INSTANCE_NAME: coolify-vm
