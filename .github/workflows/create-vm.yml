@@ -1,99 +1,124 @@
-name: Try to Create OCI Osaka A1 VM
+name: Try to Create OCI VM
+# It will run every 5 minutes.
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/5 * * * *"
+  # Allows you to manually run this workflow from the Actions tab
   workflow_dispatch:
 
 env:
-  COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
-  SUBNET_ID: ${{ secrets.OCI_OSAKA_SUBNET_ID }}
-
-  # 必须替换成大阪区域的 Ubuntu/Oracle Linux 镜像 OCID
-  IMAGE_ID: ${{ secrets.OCI_OSAKA_IMAGE_ID }}
-
-  OCI_CLI_REGION: "ap-osaka-1"
+  COMPARTMENT_ID: ${{ secrets.COMPARTMENT_ID }}
+  IMAGE_ID: ${{ secrets.OCI_CLI_IMAGE }}
+  SUBNET_ID: ${{ secrets.OCI_CLI_SUBNET }}
+  AD_NAME: ${{ secrets.OCI_CLI_AVAILABILITY_DOMAIN }}
+  OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
 
   OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
   OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
   OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
-  OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+  OCI_CLI_KEY: ${{ secrets.OCI_CLI_KEY }}
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Install OCI CLI
+      - name: Cache pip packages
+        id: cache-pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.local
+          key: ${{ runner.os }}-pip-oci-cli-v1
+
+      - name: Add OCI CLI to path
+        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Setup OCI CLI and Try to Create VM
+        id: create_vm
+        # The workflow will continue even if OCI says there is no capacity.
+        continue-on-error: true
+
         run: |
-          python3 -m pip install --user oci-cli
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          set -o pipefail
 
-      - name: Configure OCI CLI
-        run: |
-          set -e
-
-          mkdir -p "$HOME/.oci"
-
-          cat > "$HOME/.oci/oci_api_key.pem" <<'EOF'
-          ${{ secrets.OCI_CLI_KEY_CONTENT }}
-          EOF
-
-          chmod 600 "$HOME/.oci/oci_api_key.pem"
-
-          cat > "$HOME/.oci/config" <<EOF
-          [DEFAULT]
-          user=${OCI_CLI_USER}
-          tenancy=${OCI_CLI_TENANCY}
-          fingerprint=${OCI_CLI_FINGERPRINT}
-          key_file=$HOME/.oci/oci_api_key.pem
-          region=${OCI_CLI_REGION}
-          EOF
-
-          printf '%s\n' '${{ secrets.SSH_PUBLIC_KEY }}' \
-            > "$HOME/my_ssh_key.pub"
-
-      - name: Check whether VM already exists
-        id: check_vm
-        run: |
-          set -e
-
-          COUNT=$(oci compute instance list \
-            --compartment-id "$COMPARTMENT_ID" \
-            --display-name "coolify-vm" \
-            --all \
-            --query 'length(data[?"lifecycle-state" != `TERMINATED`])' \
-            --raw-output)
-
-          echo "Existing VM count: $COUNT"
-
-          if [ "$COUNT" -gt 0 ]; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "VM already exists. Nothing to do."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Try to create Osaka A1 VM
-        if: steps.check_vm.outputs.exists != 'true'
-        run: |
-          set -e
-
-          echo "Trying to create VM in Osaka..."
+          echo "========================================"
+          echo "OCI A1 VM Creation Attempt"
+          echo "Region: $OCI_CLI_REGION"
+          echo "Availability Domain: $AD_NAME"
           echo "Shape: VM.Standard.A1.Flex"
-          echo "OCPUs: 2"
+          echo "OCPU: 2"
           echo "Memory: 12 GB"
+          echo "========================================"
 
-          oci compute instance launch \
+          pip install oci-cli
+
+          mkdir -p ~/.oci
+
+          echo "${{ secrets.OCI_CLI_KEY }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+          echo "[DEFAULT]" > ~/.oci/config
+          echo "user=${{ secrets.OCI_CLI_USER }}" >> ~/.oci/config
+          echo "tenancy=${{ secrets.OCI_CLI_TENANCY }}" >> ~/.oci/config
+          echo "fingerprint=${{ secrets.OCI_CLI_FINGERPRINT }}" >> ~/.oci/config
+          echo "key_file=~/.oci/oci_api_key.pem" >> ~/.oci/config
+          echo "region=${{ secrets.OCI_CLI_REGION }}" >> ~/.oci/config
+
+          echo "${{ secrets.SSH_PUBLIC_KEY }}" > /home/runner/my_ssh_key.pub
+
+          echo ""
+          echo "Trying to create VM..."
+          echo ""
+
+          OCI_OUTPUT=$(oci compute instance launch \
             --compartment-id "$COMPARTMENT_ID" \
+            --availability-domain "$AD_NAME" \
             --shape "VM.Standard.A1.Flex" \
             --shape-config '{"ocpus":2,"memoryInGBs":12}' \
             --subnet-id "$SUBNET_ID" \
             --image-id "$IMAGE_ID" \
-            --ssh-authorized-keys-file "$HOME/my_ssh_key.pub" \
+            --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
             --assign-public-ip true \
             --display-name "coolify-vm" \
             --boot-volume-size-in-gbs 50 \
-            --wait-for-state RUNNING
+            2>&1 || true)
 
-          echo "VM created successfully."
+          echo ""
+          echo "========== OCI OUTPUT =========="
+          echo "$OCI_OUTPUT"
+          echo "================================"
+          echo ""
+
+          # Store the log as a GitHub step output
+          {
+            echo "log_data<<EOF"
+            echo "$OCI_OUTPUT"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          # Check whether OCI accepted the creation request.
+          if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
+            echo "========================================"
+            echo "SUCCESS!"
+            echo "VM creation request was accepted."
+            echo "Instance is currently PROVISIONING."
+            echo "========================================"
+            exit 0
+          fi
+
+          # Also accept RUNNING as a successful creation.
+          if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "RUNNING"'; then
+            echo "========================================"
+            echo "SUCCESS!"
+            echo "VM is already RUNNING."
+            echo "========================================"
+            exit 0
+          fi
+
+          echo "========================================"
+          echo "A1 creation attempt failed."
+          echo "The next scheduled run will try again."
+          echo "========================================"
+
+          exit 1
